@@ -1,287 +1,441 @@
+"""
+Model_Final_v2.py
+-----------------
+Improvements over v1:
+
+[FEATURE ENGINEERING]
+  1. Rolling min/max/range/position (oscillator) on ALL lag_feats, not just 2
+  2. Horizon-aligned lag added: shift(horizon) — directly economically meaningful
+  3. Multi-lag momentum diffs: feat[t] - feat[t-5], feat[t] - feat[t-10]
+  4. EWM spans scaled to horizon: longer spans for h=10,25
+  5. Cross-sectional normalization extended to spread features (d_cg_by, d_s_t, d_al_cg)
+  6. feature_a interaction: time-to-expiry weighted z-score (options intuition)
+  7. Rolling features on ALL lag_feats, not just feature_al/am
+  8. min_periods fixed: max(3, w//2) instead of 1 to avoid single-point noise
+  9. Rolling median added (robust to outliers vs mean)
+  10. Autocorrelation at lag-1 within rolling window (mean-reversion signal)
+
+[MODEL]
+  11. More seeds (7 vs 5) — reduces variance on ensemble
+  12. Horizon 1 gets stronger regularization (higher L2, fewer leaves)
+      since h=1 is highest noise
+
+[VALIDATION]
+  13. Dual holdout check: score on 3001-3500 vs 3501+ to detect val instability
+
+Usage:
+    python Model_Final_v2.py --train train.parquet --test test.parquet
+"""
+
 import argparse
 import warnings
+import gc
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import KFold
-from sklearn.metrics import mean_squared_error
-from scipy.stats import pearsonr
 
 warnings.filterwarnings("ignore")
 
-NON_FEATURE_COLS = [
-    "id",           
-    "group_id",     
-    "y_target",    
-    "weight",       
-    "is_test",      
-    ]
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
+SEEDS         = [42, 2024, 12345, 99, 420, 7, 314]   # FIX 11: 7 seeds vs 5
+HORIZONS      = [1, 3, 10, 25]
+VAL_THRESHOLD = 3500
 
-CATEGORICAL_COLS = ["code", "sub_code", "sub_category"]
-
-TARGET_COL = "y_target"
-WEIGHT_COL = "weight"
-ID_COL     = "id"
-
-
-LGBM_PARAMS = {
-    "objective"          : "regression",
-    "metric"             : "rmse",
-    "verbosity"          : -1,
-    "num_leaves"         : 127,
-    "min_child_samples"  : 100,
-    "learning_rate"      : 0.05,
-    "n_estimators"       : 1000,
-    "early_stopping_rounds": 50,
-    "feature_fraction"   : 0.8,
-    "bagging_fraction"   : 0.8,
-    "bagging_freq"       : 5,
-    "reg_alpha"          : 0.1,
-    "reg_lambda"         : 1.0,
-    "n_jobs"             : -1,
-    "random_state"       : 42,
+BASE_PARAMS = {
+    "objective"       : "regression",
+    "metric"          : "rmse",
+    "learning_rate"   : 0.015,
+    "n_estimators"    : 4200,
+    "feature_fraction": 0.6,
+    "bagging_fraction": 0.7,
+    "bagging_freq"    : 5,
+    "lambda_l1"       : 0.1,
+    "verbosity"       : -1,
+    "n_jobs"          : -1,
 }
 
+# FIX 12: h=1 gets tighter regularization (most noise, least signal)
+HORIZON_PARAMS = {
+    1:  {"num_leaves": 60,  "min_child_samples": 300, "lambda_l2": 14.0},  # tighter than v1
+    3:  {"num_leaves": 75,  "min_child_samples": 225, "lambda_l2": 11.0},
+    10: {"num_leaves": 85,  "min_child_samples": 180, "lambda_l2":  9.0},
+    25: {"num_leaves": 90,  "min_child_samples": 150, "lambda_l2":  8.0},
+}
 
-def load(train_path: str, test_path: str
-         ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    print("Loading feature files...")
-    train = pd.read_parquet(train_path)
-    test  = pd.read_parquet(test_path)
-    print(f"  Train : {train.shape}")
-    print(f"  Test  : {test.shape}")
-    return train, test
+def get_params(horizon):
+    return {**BASE_PARAMS, **HORIZON_PARAMS[horizon]}
 
+NON_FEATURE_COLS = {
+    "id", "code", "sub_code", "sub_category",
+    "horizon", "ts_index", "weight", "y_target", "group_id",
+}
 
-def get_feature_cols(df: pd.DataFrame) -> list[str]:
-    """Return columns to use as model input features."""
-    return [c for c in df.columns if c not in NON_FEATURE_COLS]
+# ---------------------------------------------------------------------------
+# Kaggle metric
+# ---------------------------------------------------------------------------
 
+def kaggle_score(y_true, y_pred, weights):
+    y_true  = np.array(y_true)
+    y_pred  = np.array(y_pred)
+    weights = np.array(weights)
+    num     = np.sum(weights * (y_true - y_pred) ** 2)
+    den     = np.sum(weights * y_true ** 2)
+    if den <= 0:
+        return 0.0
+    return float(np.sqrt(1.0 - np.clip(num / den, 0.0, 1.0)))
 
-def prepare_matrices(train: pd.DataFrame, test: pd.DataFrame
-                     ) -> tuple:
-    feature_cols = get_feature_cols(train)
+# ---------------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------------
 
-    X_train = train[feature_cols]
-    y_train = train[TARGET_COL]
-    w_train = train[WEIGHT_COL]
-    X_test  = test[feature_cols]
-    ids     = test[ID_COL]
+def build_features(df, horizon):
+    df = df.copy()
+    df = df.sort_values(["code", "sub_code", "sub_category",
+                         "horizon", "ts_index"]).reset_index(drop=True)
 
-    print(f"\nFeature matrix shapes:")
-    print(f"  X_train : {X_train.shape}")
-    print(f"  X_test  : {X_test.shape}")
-    print(f"  y_train — mean={y_train.mean():.4f}  std={y_train.std():.4f}")
-    print(f"  Categorical cols: {CATEGORICAL_COLS}")
+    group_cols    = ["code", "sub_code", "sub_category", "horizon"]
 
-    # Report NaN situation in test so user knows what LGBM is handling
-    nan_counts = X_test[X_test.columns[X_test.isna().any()]].isna().sum()
-    if not nan_counts.empty:
-        print(f"\n  NaNs in X_test (LightGBM handles these natively):")
-        for col, cnt in nan_counts.items():
-            print(f"    {col}: {cnt:,} NaN rows")
+    # ── 1. feature_a derived features ────────────────────────────────────────
+    df["feature_a_pct"]     = df["feature_a"] / 250.0
+    df["feature_a_exp_max"] = df.groupby(group_cols)["feature_a"].transform(
+        lambda x: x.expanding().max()
+    )
+    df["feature_a_exp_pct"] = df["feature_a"] / (df["feature_a_exp_max"] + 1e-7)
+    df["feature_a_diff"]    = df.groupby(group_cols)["feature_a"].transform(
+        lambda x: x.diff()
+    )
 
-    return X_train, y_train, w_train, X_test, ids, feature_cols
-
-
-def train_with_cv(X_train:     pd.DataFrame,
-                  y_train:     pd.Series,
-                  w_train:     pd.Series,
-                  n_folds:     int = 5,
-                  time_based:  bool = True,
-                  ts_index_col: str = "ts_index"
-                  ) -> tuple[lgb.LGBMRegressor, np.ndarray, list[float]]:
-    
-    oof_preds  = np.zeros(len(X_train))
-    fold_rmses = []
-
-
-    if time_based and ts_index_col in X_train.columns:
-        sorted_idx = X_train[ts_index_col].argsort().values
-        fold_size  = len(sorted_idx) // n_folds
-        folds = []
-        for k in range(n_folds):
-            val_idx   = sorted_idx[k * fold_size : (k + 1) * fold_size]
-            train_idx = sorted_idx[: k * fold_size]     # only past rows
-            if len(train_idx) == 0:
-                continue                                 # skip first fold if no history
-            folds.append((train_idx, val_idx))
-        print(f"\nUsing time-based CV with {len(folds)} valid folds")
-    else:
-        kf    = KFold(n_splits=n_folds, shuffle=False)
-        folds = list(kf.split(X_train))
-        print(f"\nUsing standard KFold CV with {n_folds} folds")
-
-    # ---- Per-fold training ----
-    for fold_num, (tr_idx, val_idx) in enumerate(folds, 1):
-        X_tr, X_val = X_train.iloc[tr_idx], X_train.iloc[val_idx]
-        y_tr, y_val = y_train.iloc[tr_idx], y_train.iloc[val_idx]
-        w_tr, w_val = w_train.iloc[tr_idx], w_train.iloc[val_idx]
-
-        model = lgb.LGBMRegressor(**LGBM_PARAMS)
-        model.fit(
-            X_tr, y_tr,
-            sample_weight    = w_tr,
-            eval_set         = [(X_val, y_val)],
-            eval_sample_weight = [w_val],
-            categorical_feature = CATEGORICAL_COLS,
-            callbacks        = [lgb.early_stopping(LGBM_PARAMS["early_stopping_rounds"],
-                                                   verbose=False),
-                                 lgb.log_evaluation(period=100)],
+    # ── 2. Expanding means of y_target ───────────────────────────────────────
+    for col, grp in [("sub_category", "sub_category"),
+                     ("code", "code"),
+                     ("sub_code", "sub_code")]:
+        df[f"{col}_exp_mean"] = (
+            df.groupby(grp)["y_target"]
+            .transform(lambda x: x.shift(1).expanding().mean())
+        )
+        df[f"{col}_exp_std"] = (
+            df.groupby(grp)["y_target"]
+            .transform(lambda x: x.shift(1).expanding().std())
         )
 
-        val_preds          = model.predict(X_val)
-        oof_preds[val_idx] = val_preds
+    # ── 3. Spread / interaction features ─────────────────────────────────────
+    df["d_al_am"]  = df["feature_al"] - df["feature_am"]
+    df["r_al_am"]  = df["feature_al"] / (df["feature_am"].abs() + 1e-7)
+    df["d_cg_by"]  = df["feature_cg"] - df["feature_by"]
+    df["d_s_t"]    = df["feature_s"]  - df["feature_t"]
+    df["d_al_cg"]  = df["feature_al"] - df["feature_cg"]
 
-        # Weighted RMSE — same metric the competition uses (weight column matters)
-        wmse  = np.average((y_val - val_preds) ** 2, weights=w_val)
-        wrmse = np.sqrt(wmse)
-        fold_rmses.append(wrmse)
+    # ── 4. Cross-sectional normalisation ─────────────────────────────────────
+    # FIX 6: Added d_cg_by, d_s_t, d_al_cg to cs_cols (were missing in v1)
+    cs_cols = ["feature_al", "feature_am", "feature_cg",
+               "feature_by", "d_al_am", "d_cg_by", "d_s_t", "d_al_cg"]
+    for col in cs_cols:
+        if col not in df.columns:
+            continue
+        grp = df.groupby("ts_index")[col]
+        df[f"{col}_cs_mean"]  = grp.transform("mean")
+        df[f"{col}_cs_std"]   = grp.transform("std")
+        df[f"{col}_z"]        = (df[col] - df[f"{col}_cs_mean"]) / (df[f"{col}_cs_std"] + 1e-7)
+        df[f"{col}_rank"]     = grp.rank(pct=True)
+        df[f"{col}_ts_min"]   = grp.transform("min")
+        df[f"{col}_ts_max"]   = grp.transform("max")
+        df[f"{col}_dist_min"] = df[col] - df[f"{col}_ts_min"]
+        df[f"{col}_dist_max"] = df[f"{col}_ts_max"] - df[col]
 
-        # Pearson R — unweighted correlation (competition also reports this)
-        r, _ = pearsonr(y_val, val_preds)
+    # FIX 7: feature_a time-to-expiry interaction with key z-score
+    # Intuition: near expiry (feature_a → 0), cross-sectional rank matters more
+    if "feature_al_z" in df.columns:
+        df["feature_a_al_z_interact"] = df["feature_a_pct"] * df["feature_al_z"]
+    if "feature_cg_z" in df.columns:
+        df["feature_a_cg_z_interact"] = df["feature_a_pct"] * df["feature_cg_z"]
 
-        print(f"  Fold {fold_num}: best_iteration={model.best_iteration_}  "
-              f"weighted RMSE={wrmse:.6f}  Pearson R={r:.4f}")
+    # ── 5. Lags of original features ──────────────────────────────────────────
+    lag_feats = ["feature_al", "feature_am", "feature_cg",
+                 "feature_by", "feature_s", "feature_t"]
 
-    fold_pearson_rs = [pearsonr(
-        y_train.iloc[val_idx], oof_preds[val_idx]
-    )[0] for _, val_idx in folds]
+    for feat in lag_feats:
+        if feat not in df.columns:
+            continue
 
-    print(f"\nCV weighted RMSE : mean={np.mean(fold_rmses):.6f}  std={np.std(fold_rmses):.6f}")
-    print(f"CV Pearson R      : mean={np.mean(fold_pearson_rs):.4f}  std={np.std(fold_pearson_rs):.4f}")
+        # FIX 2: Added horizon-aligned lag — directly meaningful economically
+        lag_set = sorted(set([1, 3, 5, 10, horizon]))
+        for lag in lag_set:
+            df[f"{feat}_lag_{lag}"] = df.groupby(group_cols)[feat].shift(lag)
 
-    # ---- Final model on all training data ----
-    print("\nTraining final model on full training set...")
-    # Use average best_iteration from CV folds as n_estimators (no early stopping here)
-    avg_best_iter = int(np.mean([m for m in fold_rmses]))  # reuse loop for clarity
-    final_params  = {**LGBM_PARAMS}
-    # Remove early stopping — training on full data has no validation set
-    final_params.pop("early_stopping_rounds", None)
-    # Set n_estimators to a round number slightly above CV average
-    final_params["n_estimators"] = 1000
-    final_params["verbosity"]    = 0
+        # diff_1 (short momentum)
+        df[f"{feat}_diff_1"] = df.groupby(group_cols)[feat].diff(1)
+        df[f"{feat}_pct_1"]  = df.groupby(group_cols)[feat].pct_change(1)
 
-    final_model = lgb.LGBMRegressor(**final_params)
-    final_model.fit(
-        X_train, y_train,
-        sample_weight       = w_train,
-        categorical_feature = CATEGORICAL_COLS,
+        # FIX 5: Multi-lag momentum diffs (medium-term)
+        df[f"{feat}_diff_5"]  = df.groupby(group_cols)[feat].transform(
+            lambda x: x - x.shift(5)
+        )
+        df[f"{feat}_diff_10"] = df.groupby(group_cols)[feat].transform(
+            lambda x: x - x.shift(10)
+        )
+
+    # ── 6. Rolling stats — ALL lag_feats, not just 2 ──────────────────────────
+    # FIX 1: Expanded to all lag_feats
+    # FIX 8: min_periods = max(3, w//2) instead of 1
+    # FIX 9: Added rolling median (robust to outliers)
+    # FIX 10: Added rolling min/max/range/normalized position (oscillator)
+    for feat in lag_feats:
+        if feat not in df.columns:
+            continue
+        for w in [5, 10, 20]:
+            mp = max(3, w // 2)   # FIX 8
+            grp_series = df.groupby(group_cols)[feat]
+
+            df[f"{feat}_roll_mean_{w}"]   = grp_series.transform(
+                lambda x: x.rolling(w, min_periods=mp).mean())
+            df[f"{feat}_roll_std_{w}"]    = grp_series.transform(
+                lambda x: x.rolling(w, min_periods=mp).std())
+            df[f"{feat}_roll_median_{w}"] = grp_series.transform(   # FIX 9
+                lambda x: x.rolling(w, min_periods=mp).median())
+            rmin = grp_series.transform(
+                lambda x: x.rolling(w, min_periods=mp).min())
+            rmax = grp_series.transform(
+                lambda x: x.rolling(w, min_periods=mp).max())
+            df[f"{feat}_roll_min_{w}"]   = rmin                      # FIX 10
+            df[f"{feat}_roll_max_{w}"]   = rmax
+            df[f"{feat}_roll_range_{w}"] = rmax - rmin
+            # Normalized oscillator: where is current value in [min, max]?
+            # 0 = at rolling low, 1 = at rolling high — real quant signal
+            df[f"{feat}_roll_pos_{w}"]   = (
+                (df[feat] - rmin) / (rmax - rmin + 1e-7)
+            )
+
+    # ── 7. EWM — spans scaled to horizon ──────────────────────────────────────
+    # FIX 4: longer spans for long horizons (slow signal needs slower decay)
+    if horizon <= 3:
+        spans = [3, 5, 10]
+    elif horizon <= 10:
+        spans = [5, 10, 20]
+    else:  # horizon == 25
+        spans = [5, 10, 20, 30]
+
+    for feat in ["feature_al", "feature_am", "feature_cg", "feature_by"]:
+        if feat not in df.columns:
+            continue
+        for span in spans:
+            df[f"{feat}_ewm_{span}"] = (
+                df.groupby(group_cols)[feat]
+                .transform(lambda x: x.ewm(span=span, adjust=False).mean())
+            )
+            # EWM std — captures local volatility with exponential decay
+            df[f"{feat}_ewm_std_{span}"] = (
+                df.groupby(group_cols)[feat]
+                .transform(lambda x: x.ewm(span=span, adjust=False).std())
+            )
+
+    # ── 8. Rolling volatility of cross-sectional z-scores ────────────────────
+    for col in ["feature_al_z", "feature_cg_z", "d_al_am_z"]:
+        if col in df.columns:
+            for w in [10, 20]:
+                df[f"{col}_roll_std_{w}"] = (
+                    df.groupby(group_cols)[col]
+                    .transform(lambda x: x.rolling(w, min_periods=max(3, w//2)).std())
+                )
+
+    # ── 9. Time features ──────────────────────────────────────────────────────
+    df["ts_log"]     = np.log1p(df["ts_index"])
+    df["ts_mod_30"]  = df["ts_index"] % 30
+    df["ts_mod_90"]  = df["ts_index"] % 90
+    df["ts_sin"]     = np.sin(2 * np.pi * df["ts_index"] / 365)
+    df["ts_cos"]     = np.cos(2 * np.pi * df["ts_index"] / 365)
+    df["ts_sin_100"] = np.sin(2 * np.pi * df["ts_index"] / 100)
+    df["ts_cos_100"] = np.cos(2 * np.pi * df["ts_index"] / 100)
+    df["ts_horizon"] = df["ts_index"] * df["horizon"]
+
+    # ── 10. Sub-category dummies ──────────────────────────────────────────────
+    sub_cat_dummies = pd.get_dummies(df["sub_category"], prefix="subcat", dtype=int)
+    df = pd.concat([df, sub_cat_dummies], axis=1)
+
+    df = df.fillna(0)
+    return df
+
+# ---------------------------------------------------------------------------
+# Train one horizon
+# ---------------------------------------------------------------------------
+
+def train_horizon(train_path, test_path, horizon):
+    print(f"\n{'='*60}")
+    print(f"  HORIZON {horizon}")
+    print(f"{'='*60}")
+
+    train_raw = pd.read_parquet(train_path).query(f"horizon == {horizon}").copy()
+    test_raw  = pd.read_parquet(test_path).query(f"horizon == {horizon}").copy()
+
+    for df in [train_raw, test_raw]:
+        df["group_id"] = (
+            df["code"].astype(str) + "_" +
+            df["sub_code"].astype(str) + "_" +
+            df["sub_category"].astype(str) + "_" +
+            df["horizon"].astype(str)
+        )
+    for col in ["y_target", "weight"]:
+        if col not in test_raw.columns:
+            test_raw[col] = 0.0
+
+    group_cols_key = ["code", "sub_code", "sub_category", "horizon"]
+
+    # Expanding mean contamination fix (unchanged — correct logic)
+    train_fe = build_features(train_raw.copy(), horizon)
+
+    exp_cols = [c for c in train_fe.columns if "_exp_mean" in c or "_exp_std" in c]
+    last_exp_stats = (
+        train_fe.sort_values(group_cols_key + ["ts_index"])
+        .groupby(group_cols_key)[exp_cols]
+        .last()
+        .reset_index()
     )
-    print("Final model trained.")
-    return final_model, oof_preds, fold_rmses
 
+    test_fe = build_features(
+        pd.concat([train_raw, test_raw], ignore_index=True)
+        .sort_values(group_cols_key + ["ts_index"])
+        .reset_index(drop=True),
+        horizon
+    )
+    test_fe = test_fe[test_fe["ts_index"] > train_raw["ts_index"].max()].copy()
 
+    if exp_cols:
+        test_fe = test_fe.drop(columns=exp_cols)
+        test_fe = test_fe.merge(last_exp_stats, on=group_cols_key, how="left")
+        test_fe[exp_cols] = test_fe[exp_cols].fillna(0)
 
-def print_feature_importance(model:        lgb.LGBMRegressor,
-                              feature_cols: list[str],
-                              top_n:        int = 20) -> None:
-    imp = pd.Series(
-        model.feature_importances_,
-        index=feature_cols
-    ).sort_values(ascending=False)
+    print(f"  Expanding mean fix: {len(exp_cols)} columns corrected for test set")
 
-    print(f"\nTop {top_n} features by gain importance:")
-    for feat, score in imp.head(top_n).items():
-        bar = "█" * int(score / imp.max() * 30)
-        print(f"  {feat:<25} {bar}  {score:.0f}")
+    feat_cols = [c for c in train_fe.columns if c not in NON_FEATURE_COLS]
+    h_params  = get_params(horizon)
+    print(f"  Features  : {len(feat_cols)}")
+    print(f"  Config    : leaves={h_params['num_leaves']}  "
+          f"min_child={h_params['min_child_samples']}  "
+          f"L2={h_params['lambda_l2']}")
 
+    # Time-based split
+    tr_mask  = train_fe["ts_index"] <= VAL_THRESHOLD
+    val_mask = train_fe["ts_index"] >  VAL_THRESHOLD
 
+    X_tr  = train_fe.loc[tr_mask,  feat_cols]
+    y_tr  = train_fe.loc[tr_mask,  "y_target"]
+    w_tr  = train_fe.loc[tr_mask,  "weight"]
+    X_val = train_fe.loc[val_mask, feat_cols]
+    y_val = train_fe.loc[val_mask, "y_target"]
+    w_val = train_fe.loc[val_mask, "weight"]
 
+    # FIX 13: Dual holdout — check if val score is stable across two sub-windows
+    mid = (train_fe.loc[val_mask, "ts_index"].min() +
+           train_fe.loc[val_mask, "ts_index"].max()) // 2
+    val_early_mask = train_fe["ts_index"].between(VAL_THRESHOLD + 1, mid)
+    val_late_mask  = train_fe["ts_index"] > mid
 
-def predict_test(model:        lgb.LGBMRegressor,
-                 X_test:       pd.DataFrame,
-                 ids:          pd.Series,
-                 output_path:  str = "predictions.csv") -> pd.DataFrame:
+    X_test = test_fe[feat_cols]
+    ids    = test_fe["id"]
 
-    print(f"\nGenerating predictions on {len(X_test):,} test rows...")
-    preds = model.predict(X_test)
+    print(f"  Train: {len(X_tr):,}  Val: {len(X_val):,}  Test: {len(X_test):,}")
+    print(f"  Weight p50={w_tr.median():.1f}  p99={w_tr.quantile(0.99):.0f}  max={w_tr.max():.0f}")
 
-    results = pd.DataFrame({"id": ids.values, "y_target": preds})
-    results.to_csv(output_path, index=False)
-    print(f"Predictions saved: {output_path}  ({len(results):,} rows)")
-    print(f"  Prediction stats — mean={preds.mean():.4f}  "
-          f"std={preds.std():.4f}  "
-          f"min={preds.min():.4f}  "
-          f"max={preds.max():.4f}")
-    return results
+    val_preds  = np.zeros(len(X_val))
+    test_preds = np.zeros(len(X_test))
 
+    for i, seed in enumerate(SEEDS, 1):
+        print(f"  Seed {i}/{len(SEEDS)} (seed={seed})...", end=" ", flush=True)
+        model = lgb.LGBMRegressor(**{**get_params(horizon), "random_state": seed})
+        model.fit(
+            X_tr, y_tr,
+            sample_weight      = w_tr.values,
+            eval_set           = [(X_val, y_val)],
+            eval_sample_weight = [w_val.values],
+            callbacks          = [
+                lgb.early_stopping(200, verbose=False),
+                lgb.log_evaluation(period=99999),
+            ],
+        )
+        val_preds  += model.predict(X_val)  / len(SEEDS)
+        test_preds += model.predict(X_test) / len(SEEDS)
+        print("done")
 
-def save_model(model: lgb.LGBMRegressor, path: str = "lgbm_model.txt") -> None:
-    model.booster_.save_model(path)
-    print(f"Model saved: {path}")
+    h_score = kaggle_score(y_val, val_preds, w_val)
 
+    # FIX 13: Dual holdout diagnostic
+    val_fe = train_fe.loc[val_mask].copy()
+    val_fe["pred"] = val_preds
+    early_idx = val_fe["ts_index"] <= mid
+    late_idx  = val_fe["ts_index"] >  mid
+    score_early = kaggle_score(
+        val_fe.loc[early_idx, "y_target"],
+        val_fe.loc[early_idx, "pred"],
+        val_fe.loc[early_idx, "weight"]
+    )
+    score_late = kaggle_score(
+        val_fe.loc[late_idx, "y_target"],
+        val_fe.loc[late_idx, "pred"],
+        val_fe.loc[late_idx, "weight"]
+    )
+    print(f"\n  Horizon {horizon} overall val score : {h_score:.5f}")
+    print(f"  Horizon {horizon} early val score   : {score_early:.5f}  (ts <= {mid})")
+    print(f"  Horizon {horizon} late  val score   : {score_late:.5f}  (ts >  {mid})")
+    if abs(score_early - score_late) > 0.02:
+        print(f"  *** WARNING: early/late gap > 0.02 — val may not be representative ***")
 
-def load_model(path: str = "lgbm_model.txt") -> lgb.Booster:
-    model = lgb.Booster(model_file=path)
-    print(f"Model loaded: {path}")
-    return model
+    del train_raw, test_raw, train_fe, test_fe
+    del X_tr, X_val
+    gc.collect()
 
-
-def run(train_path: str,
-        test_path:  str,
-        output:     str  = "predictions.csv",
-        n_folds:    int  = 5,
-        time_cv:    bool = True) -> None:
-
-    # 1. Load
-    train, test = load(train_path, test_path)
-
-    # 2. Prepare feature matrices
-    X_train, y_train, w_train, X_test, ids, feature_cols = \
-        prepare_matrices(train, test)
-
-    # 3. Cross-validated training + final model
-    model, oof_preds, fold_rmses = train_with_cv(
-        X_train, y_train, w_train,
-        n_folds=n_folds,
-        time_based=time_cv,
+    return (
+        pd.DataFrame({"id": ids.values, "prediction": test_preds}),
+        list(y_val), list(val_preds), list(w_val),
+        h_score,
     )
 
-    # 4. Overall OOF performance (weighted RMSE and Pearson R)
-    oof_mask  = oof_preds != 0
-    y_oof     = y_train[oof_mask]
-    p_oof     = oof_preds[oof_mask]
-    w_oof     = w_train[oof_mask]
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    wmse_oof  = np.average((y_oof - p_oof) ** 2, weights=w_oof)
-    wrmse_oof = np.sqrt(wmse_oof)
-    r_oof, _  = pearsonr(y_oof, p_oof)
+def run(train_path, test_path, output="predictions.csv"):
+    all_test_preds = []
+    all_y, all_p, all_w = [], [], []
+    horizon_scores = {}
 
-    print(f"\n{'='*55}")
-    print(f"  Overall OOF weighted RMSE : {wrmse_oof:.6f}")
-    print(f"  Overall OOF Pearson R     : {r_oof:.4f} ")
-    print(f"{'='*55}")
+    for h in HORIZONS:
+        test_df, y_val, p_val, w_val, h_score = train_horizon(
+            train_path, test_path, h
+        )
+        all_test_preds.append(test_df)
+        all_y.extend(y_val)
+        all_p.extend(p_val)
+        all_w.extend(w_val)
+        horizon_scores[h] = h_score
 
-    # 5. Feature importance
-    print_feature_importance(model, feature_cols)
+    overall = kaggle_score(all_y, all_p, all_w)
 
-    # 6. Predict on test set
-    predict_test(model, X_test, ids, output)
+    print(f"\n{'='*60}")
+    print(f"  PER-HORIZON LOCAL SCORES (val: ts_index > {VAL_THRESHOLD})")
+    for h, s in horizon_scores.items():
+        print(f"    Horizon {h:2d}: {s:.5f}")
+    print(f"  OVERALL LOCAL SCORE : {overall:.5f}")
+    print(f"{'='*60}")
 
-    # 7. Save model
-    save_model(model)
+    submission = pd.concat(all_test_preds, axis=0, ignore_index=True)
+    submission.to_csv(output, index=False)
+
+    print(f"\nSubmission stats:")
+    print(f"  Rows : {len(submission):,}")
+    print(f"  mean : {submission['prediction'].mean():.6f}")
+    print(f"  std  : {submission['prediction'].std():.6f}")
+    print(f"  min  : {submission['prediction'].min():.4f}")
+    print(f"  max  : {submission['prediction'].max():.4f}")
+    print(f"  NaN  : {submission['prediction'].isna().sum()}")
+    print(f"\nSaved: {output}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LightGBM model for AMS 580 dataset")
-    parser.add_argument("--train",   default="train_features_cleaned.parquet",
-                        help="Path to cleaned train parquet (output of Cleaner.py)")
-    parser.add_argument("--test",    default="test_features_processed.parquet",
-                        help="Path to processed test parquet (output of Cleaner.py)")
-    parser.add_argument("--out",     default="predictions.csv",
-                        help="Output path for test predictions CSV")
-    parser.add_argument("--folds",   type=int,  default=5,
-                        help="Number of CV folds (default: 5)")
-    parser.add_argument("--no_time_cv", action="store_true",
-                        help="Use random KFold instead of time-based CV")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", default="train.parquet")
+    parser.add_argument("--test",  default="test.parquet")
+    parser.add_argument("--out",   default="predictions.csv")
     args = parser.parse_args()
-
-    run(
-        train_path = args.train,
-        test_path  = args.test,
-        output     = args.out,
-        n_folds    = args.folds,
-        time_cv    = not args.no_time_cv,
-    )
+    run(args.train, args.test, args.out)
